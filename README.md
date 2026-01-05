@@ -49,3 +49,36 @@ make run
 ```
 
 **Note:** If `~/.aws/credentials` is empty but AWS CLI works (using SSO), use Option 1.
+
+## Docker
+
+### Build Locally
+
+Build Docker image for local use:
+
+```bash
+docker build -t job-service:local .
+```
+
+Run the container locally:
+
+```bash
+docker run -p 8080:8080 \
+  -e AWS_REGION=us-east-1 \
+  -e SQS_QUEUE_URL=https://sqs.us-east-1.amazonaws.com/123456789012/queue-name \
+  -e S3_BUCKET=your-bucket-name \
+  -e WORKER_ENABLED=true \
+  job-service:local
+```
+
+### Build and Push to Docker Hub
+
+```bash
+# Build image
+docker build -t noppadol26dw/job-service:v1 .
+
+# Push to Docker Hub
+docker push noppadol26dw/job-service:v1
+```
+
+**Docker Hub:** https://hub.docker.com/r/noppadol26dw/job-service
