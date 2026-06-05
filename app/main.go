@@ -7,19 +7,38 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
 	"github.com/google/uuid"
+)
+
+const (
+	addr = ":8080"
+
+	// maxBodyBytes caps the size of an incoming request body to guard against
+	// oversized or malicious payloads.
+	maxBodyBytes = 1 << 20 // 1 MiB
+
+	// awsOpTimeout bounds each individual AWS API call so a hung dependency
+	// cannot block a request or the worker indefinitely.
+	awsOpTimeout = 10 * time.Second
+
+	// shutdownTimeout bounds graceful shutdown of the HTTP server.
+	shutdownTimeout = 15 * time.Second
 )
 
 // App holds the application state and AWS service clients.
@@ -51,7 +70,8 @@ type JobResult struct {
 
 // main initializes the application, sets up AWS clients, registers HTTP handlers,
 // and starts the HTTP server. If WORKER_ENABLED is set to "true", it also starts
-// the background worker loop for processing jobs.
+// the background worker loop for processing jobs. The server shuts down gracefully
+// on SIGINT/SIGTERM.
 func main() {
 	// Load AWS region from environment variable, default to us-east-1
 	region := os.Getenv("AWS_REGION")
@@ -60,7 +80,7 @@ func main() {
 	}
 
 	// Load AWS configuration using default credential chain
-	cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(region))
+	cfg, err := config.LoadDefaultConfig(context.Background(), config.WithRegion(region))
 	if err != nil {
 		log.Fatalf("failed to load AWS config: %v", err)
 	}
@@ -84,33 +104,65 @@ func main() {
 		s3Bucket:  s3Bucket,
 	}
 
-	// Register HTTP handlers
-	http.HandleFunc("/healthz", app.healthz)
-	http.HandleFunc("/readyz", app.readyz)
-	http.HandleFunc("/jobs", app.createJob)
-	http.HandleFunc("/jobs/", app.getJob)
+	// Register HTTP handlers using method-based routing (Go 1.22+). The {id}
+	// wildcard matches a single path segment, so nested paths do not leak
+	// through, and unmatched methods automatically return 405.
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", app.healthz)
+	mux.HandleFunc("GET /readyz", app.readyz)
+	mux.HandleFunc("POST /jobs", app.createJob)
+	mux.HandleFunc("GET /jobs/{id}", app.getJob)
+
+	// Root context cancelled on SIGINT/SIGTERM, used to stop the worker loop
+	// and trigger graceful HTTP shutdown.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
 	// Start worker loop if enabled
-	workerEnabled := os.Getenv("WORKER_ENABLED") == "true"
-	if workerEnabled {
-		go app.workerLoop()
+	if os.Getenv("WORKER_ENABLED") == "true" {
+		go app.workerLoop(ctx)
 		log.Println("Worker enabled, starting background processing")
 	}
 
-	// Start HTTP server
-	log.Println("Server starting on :8080")
-	if err := http.ListenAndServe(":8080", nil); err != nil {
-		log.Fatalf("server failed: %v", err)
+	server := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
+
+	// Run the server in the background so main can wait for a shutdown signal.
+	serverErr := make(chan error, 1)
+	go func() {
+		log.Printf("Server starting on %s", addr)
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serverErr <- err
+		}
+	}()
+
+	// Wait for either a fatal server error or a shutdown signal.
+	select {
+	case err := <-serverErr:
+		log.Fatalf("server failed: %v", err)
+	case <-ctx.Done():
+		log.Println("shutdown signal received, draining connections")
+	}
+
+	// Graceful shutdown: stop accepting new connections and let in-flight
+	// requests finish, bounded by shutdownTimeout.
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		log.Printf("graceful shutdown failed: %v", err)
+	}
+	log.Println("server stopped")
 }
 
 // healthz handles GET /healthz requests.
 // Returns 200 OK with "ok" response for health checks.
 func (a *App) healthz(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("ok"))
 }
@@ -118,10 +170,6 @@ func (a *App) healthz(w http.ResponseWriter, r *http.Request) {
 // readyz handles GET /readyz requests.
 // Returns 200 OK with "ready" if AWS clients are initialized, otherwise 503.
 func (a *App) readyz(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
 	if a.sqsClient == nil || a.s3Client == nil {
 		http.Error(w, "not ready", http.StatusServiceUnavailable)
 		return
@@ -132,17 +180,22 @@ func (a *App) readyz(w http.ResponseWriter, r *http.Request) {
 
 // createJob handles POST /jobs requests.
 // Accepts JSON {"text":"..."}, generates a job ID, sends message to SQS,
-// and returns the job ID with 201 Created status.
+// and returns the job ID with 201 Created status. The request body is capped
+// at maxBodyBytes and the text field must be non-empty.
 func (a *App) createJob(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
+	// Cap the request body to guard against oversized payloads.
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 
 	// Decode request body
 	var req JobRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	// Validate input
+	if strings.TrimSpace(req.Text) == "" {
+		http.Error(w, "text is required", http.StatusBadRequest)
 		return
 	}
 
@@ -160,8 +213,10 @@ func (a *App) createJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Send message to SQS queue
-	_, err = a.sqsClient.SendMessage(context.TODO(), &sqs.SendMessageInput{
+	// Send message to SQS queue, bounded by a per-request timeout.
+	ctx, cancel := context.WithTimeout(r.Context(), awsOpTimeout)
+	defer cancel()
+	_, err = a.sqsClient.SendMessage(ctx, &sqs.SendMessageInput{
 		QueueUrl:    aws.String(a.sqsURL),
 		MessageBody: aws.String(string(messageBody)),
 	})
@@ -179,28 +234,34 @@ func (a *App) createJob(w http.ResponseWriter, r *http.Request) {
 
 // getJob handles GET /jobs/{id} requests.
 // Retrieves job result from S3 and returns it as JSON.
-// Returns 404 if job not found, 200 OK with job result if found.
+// Returns 404 only when the object does not exist, 500 for other S3 errors,
+// and 200 OK with the job result when found.
 func (a *App) getJob(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	// Extract job ID from URL path
-	jobID := r.URL.Path[len("/jobs/"):]
+	// Extract job ID from the path wildcard.
+	jobID := r.PathValue("id")
 	if jobID == "" {
 		http.Error(w, "job id required", http.StatusBadRequest)
 		return
 	}
 
-	// Get job result from S3
+	// Get job result from S3, bounded by a per-request timeout.
+	ctx, cancel := context.WithTimeout(r.Context(), awsOpTimeout)
+	defer cancel()
 	key := fmt.Sprintf("jobs/%s.json", jobID)
-	result, err := a.s3Client.GetObject(context.TODO(), &s3.GetObjectInput{
+	result, err := a.s3Client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(a.s3Bucket),
 		Key:    aws.String(key),
 	})
 	if err != nil {
-		http.Error(w, "job not found", http.StatusNotFound)
+		// Distinguish a genuine "not found" from infrastructure errors
+		// (permissions, throttling, network) so callers are not misled.
+		var noSuchKey *s3types.NoSuchKey
+		if errors.As(err, &noSuchKey) {
+			http.Error(w, "job not found", http.StatusNotFound)
+			return
+		}
+		log.Printf("failed to get object %q: %v", key, err)
+		http.Error(w, "failed to get job", http.StatusInternalServerError)
 		return
 	}
 	defer result.Body.Close()
@@ -220,33 +281,54 @@ func (a *App) getJob(w http.ResponseWriter, r *http.Request) {
 // workerLoop runs continuously to process messages from SQS queue.
 // Uses long polling (20 seconds) to receive messages, processes each message,
 // stores result in S3, and deletes message from queue after successful processing.
+// It stops when ctx is cancelled (e.g. on shutdown). The in-flight message is
+// allowed to finish cleanly before returning.
 // Only runs when WORKER_ENABLED environment variable is set to "true".
-func (a *App) workerLoop() {
+func (a *App) workerLoop(ctx context.Context) {
 	for {
-		// Receive message from SQS with long polling (20 seconds)
-		result, err := a.sqsClient.ReceiveMessage(context.TODO(), &sqs.ReceiveMessageInput{
+		// Stop promptly if shutdown was requested.
+		if ctx.Err() != nil {
+			log.Println("worker stopping")
+			return
+		}
+
+		// Receive message from SQS with long polling (20 seconds). The
+		// cancellable context lets shutdown interrupt the long poll.
+		result, err := a.sqsClient.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{
 			QueueUrl:            aws.String(a.sqsURL),
 			MaxNumberOfMessages: 1,
 			WaitTimeSeconds:     20, // Long polling
 		})
 		if err != nil {
+			if ctx.Err() != nil {
+				log.Println("worker stopping")
+				return
+			}
 			log.Printf("failed to receive message: %v", err)
-			time.Sleep(5 * time.Second)
+			// Back off before retrying, but stay responsive to shutdown.
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(5 * time.Second):
+			}
 			continue
 		}
 
-		// Process each received message
+		// Process each received message. Use a background-derived context so
+		// the in-flight message completes even if shutdown is in progress.
 		for _, message := range result.Messages {
 			if err := a.processMessage(message); err != nil {
 				log.Printf("failed to process message: %v", err)
 				continue
 			}
 
-			// Delete message from queue after successful processing
-			_, err = a.sqsClient.DeleteMessage(context.TODO(), &sqs.DeleteMessageInput{
+			// Delete message from queue after successful processing.
+			delCtx, cancel := context.WithTimeout(context.Background(), awsOpTimeout)
+			_, err = a.sqsClient.DeleteMessage(delCtx, &sqs.DeleteMessageInput{
 				QueueUrl:      aws.String(a.sqsURL),
 				ReceiptHandle: message.ReceiptHandle,
 			})
+			cancel()
 			if err != nil {
 				log.Printf("failed to delete message: %v", err)
 			}
@@ -282,9 +364,12 @@ func (a *App) processMessage(message types.Message) error {
 		return fmt.Errorf("failed to marshal result: %w", err)
 	}
 
-	// Store result in S3
+	// Store result in S3, bounded by a per-operation timeout so a hung put
+	// cannot stall the worker indefinitely.
+	ctx, cancel := context.WithTimeout(context.Background(), awsOpTimeout)
+	defer cancel()
 	key := fmt.Sprintf("jobs/%s.json", jobMsg.ID)
-	_, err = a.s3Client.PutObject(context.TODO(), &s3.PutObjectInput{
+	_, err = a.s3Client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket:      aws.String(a.s3Bucket),
 		Key:         aws.String(key),
 		Body:        bytes.NewReader(resultBody),
