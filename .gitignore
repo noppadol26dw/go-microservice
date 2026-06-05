@@ -64,3 +64,6 @@ Thumbs.db
 # Project specific
 #run-local.sh
 
+# Claude Code local settings (machine-specific, not shared)
+.claude/settings.local.json
+
