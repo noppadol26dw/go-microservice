@@ -15,12 +15,12 @@ deploy/
     └── execution-role-policy.json # SSM read for the collector config
 ```
 
-> **Heads up:** `app/main.go` is **not yet OpenTelemetry-instrumented**. Per
-> [ADR 0001](../docs/adr/0001-observability-stack.md), observability is still
-> *proposed*. These files are the infrastructure so that the moment the OTel Go
-> SDK is wired in (otelhttp handlers, `processMessage` spans, metrics), telemetry
-> has a collector + backends to land in. Until then the collector simply runs
-> idle — no traces/metrics are produced yet.
+> **Note:** the app **is** OpenTelemetry-instrumented (`app/otel.go`, `app/main.go`):
+> `otelhttp` on the job endpoints, `otelaws` spans for SQS/S3, a `processMessage`
+> span, `jobs.created` / `job.processing.duration` instruments, SQS trace-context
+> propagation, and `slog` logs carrying `trace_id`/`span_id`. It exports OTLP/gRPC
+> to the collector sidecar configured here. See
+> [ADR 0001](../docs/adr/0001-observability-stack.md) (accepted).
 
 ## How the sidecar pattern works
 

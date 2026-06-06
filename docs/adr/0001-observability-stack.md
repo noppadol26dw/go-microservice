@@ -100,8 +100,8 @@ Shared, regardless of backend:
 - Export traces → X-Ray, metrics/logs → CloudWatch.
 - Extra dep: `github.com/aws/aws-xray-sdk-go` (optional; OTLP→X-Ray works without it).
 - A worked ECS Fargate deployment (task definition, collector config, IAM) lives
-  in [`deploy/`](../../deploy/README.md) — infrastructure only; the app SDK
-  instrumentation is still pending per this ADR.
+  in [`deploy/`](../../deploy/README.md). The app SDK instrumentation is
+  implemented (see "Decision Outcome").
 
 ### Option 2 — LGTM specifics
 
@@ -112,8 +112,10 @@ Shared, regardless of backend:
 
 ## Notes
 
-- The dependency versions in the original notes were OpenTelemetry `v1.21.0` /
-  contrib `v0.46.1` (late-2023). **Refresh to current releases at implementation
-  time** — do not copy those pins.
-- Until this is implemented, treat any observability reference in older docs as a
-  proposal, not current behavior. The code in `app/main.go` has none of this.
+- Implemented against OpenTelemetry Go SDK **v1.44.0** (which requires Go ≥1.25;
+  the repo builds on Go 1.26). The original late-2023 pins (`v1.21.0` / contrib
+  `v0.46.1`) are historical only — see `go.mod` for the actual versions.
+- The instrumentation lives in `app/otel.go` (setup, instruments, `slog` handler,
+  SQS trace carriers) and `app/main.go` (handler/worker wiring). The logging
+  backend is OTLP-agnostic `slog`; only the collector/exporter config is
+  backend-specific.

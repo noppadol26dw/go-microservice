@@ -32,6 +32,8 @@ This file adds only the agent-only layer: conventions, guardrails, and gotchas.
 - **`getJob` 404 vs 500** — uses `errors.As(&s3types.NoSuchKey)`; only a missing object is `404`, other S3 errors are logged and return `500`.
 - **`createJob` input hardening** — body capped at 1 MiB via `http.MaxBytesReader`; empty/whitespace `text` is rejected with `400`.
 - **Routing** — method-based mux patterns (`GET /healthz`, `POST /jobs`, `GET /jobs/{id}`); `{id}` matches a single segment (no nested-path leak) and wrong methods return `405` automatically via `r.PathValue`.
+- **Docker build output path** — build to `-o /build/bin/app`, **not** `-o app`: the latter collides with the `./app` source dir, so Go writes the binary inside it and the final `COPY` makes `/app` a directory (`exec /app: is a directory`). Don't revert to `-o app`.
+- **Multi-arch image** — the Dockerfile cross-compiles via `FROM --platform=$BUILDPLATFORM` + `ARG TARGETOS/TARGETARCH`; publish with `docker buildx --platform linux/amd64,linux/arm64 --push` so the image runs on default x86_64 Fargate (a plain `docker build` on Apple Silicon yields an arm64-only image). Current published tag: `v2`.
 
 ## Git Workflow
 

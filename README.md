@@ -12,12 +12,12 @@ Minimal Go HTTP microservice that accepts text jobs over HTTP, queues them via A
 
 | Component | Version / Detail |
 |---|---|
-| Language | Go 1.25 (`go.mod`) |
+| Language | Go 1.26 (`go.mod`) |
 | HTTP | stdlib `net/http` (no framework), listens on `:8080` |
 | AWS SDK | `aws-sdk-go-v2` — `config`, `service/s3`, `service/sqs` |
 | Observability | OpenTelemetry SDK — OTLP/gRPC traces + metrics, X-Ray propagation, `slog` JSON logs carrying `trace_id`/`span_id` (exports to the ADOT collector sidecar) |
 | IDs | `github.com/google/uuid` |
-| Container base | `golang:1.25-alpine` (build) → `gcr.io/distroless/static-debian12:nonroot` (runtime) |
+| Container base | `golang:1.26-alpine` (build) → `gcr.io/distroless/static-debian12:nonroot` (runtime) |
 
 ## Architecture
 
@@ -32,18 +32,26 @@ Client ◀──GET /jobs/{id}── HTTP handler ◀──GetObject── S3 �
 - The HTTP server and the worker loop run in the same process. The worker is a goroutine started only when `WORKER_ENABLED=true`; without it, the service only enqueues and serves reads.
 - `processMessage` uppercases the job `text` and writes the `JobResult` JSON to S3 key `jobs/{id}.json`.
 - The worker deletes the SQS message only after a successful S3 put; failures are logged and the message is left for redelivery.
+- **Observability:** the whole pipeline is OpenTelemetry-instrumented. The trace context is propagated through the SQS message attributes, so a single job is one end-to-end trace across `HTTP → SQS → Worker → S3`. Telemetry exports over OTLP/gRPC to a co-located ADOT collector (see [`deploy/`](deploy/README.md)).
 
 ## Directory Structure
 
 ```
 .
 ├── app/
-│   └── main.go        # entire application: App struct, HTTP handlers, worker loop
+│   ├── main.go        # App struct, HTTP handlers, worker loop
+│   └── otel.go        # OpenTelemetry setup, metric instruments, slog handler, SQS trace carriers
+├── deploy/            # ECS Fargate + ADOT collector deployment (see deploy/README.md)
+│   ├── ecs/
+│   │   └── task-definition.json     # app container + aws-otel-collector sidecar
+│   ├── otel/
+│   │   └── collector-config.yaml     # OTLP -> X-Ray (traces) + CloudWatch (metrics)
+│   └── iam/                          # task-role / execution-role policies
 ├── docs/
 │   ├── adr/
-│   │   └── 0001-observability-stack.md  # ADR: ADOT vs LGTM observability (proposed, deferred)
+│   │   └── 0001-observability-stack.md  # ADR: observability (accepted — ADOT on ECS)
 │   └── SEQUENCE.md    # mermaid sequence diagrams of the job/health/worker flows
-├── Dockerfile         # multi-stage build → distroless nonroot image
+├── Dockerfile         # multi-stage, multi-arch build → distroless nonroot image
 ├── Makefile           # build / test / run targets
 └── run-local.sh       # exports SSO creds + env vars, then `make run`
 ```

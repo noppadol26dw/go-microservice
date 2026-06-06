@@ -1,5 +1,11 @@
 # Sequence Diagram
 
+> **Observability:** every flow below is OpenTelemetry-instrumented. The HTTP
+> handlers emit server spans (`otelhttp`), AWS calls emit client spans
+> (`otelaws`), and the trace context is carried in the SQS message attributes so
+> the worker's `processMessage` span continues the same trace started by
+> `POST /jobs`. Logs are `slog` JSON lines tagged with `trace_id`/`span_id`.
+
 ## Job Processing Flow
 
 ```mermaid
@@ -16,7 +22,7 @@ sequenceDiagram
         HTTP Server-->>Client: 400 Bad Request
     else valid
         HTTP Server->>HTTP Server: Generate UUID job ID
-        HTTP Server->>SQS: SendMessage({id, text})
+        HTTP Server->>SQS: SendMessage({id, text}, trace context in MessageAttributes)
         alt SQS send fails
             HTTP Server-->>Client: 500 Internal Server Error
         else sent
@@ -26,8 +32,9 @@ sequenceDiagram
     end
 
     Note over Client,S3: Background Processing (if WORKER_ENABLED=true)
-    Worker->>SQS: ReceiveMessage (long polling, 20s)
-    SQS-->>Worker: Message {id, text}
+    Worker->>SQS: ReceiveMessage (long polling, 20s; MessageAttributeNames: All)
+    SQS-->>Worker: Message {id, text} + trace context
+    Worker->>Worker: Extract trace context, start processMessage span
     Worker->>Worker: Process: strings.ToUpper(text)
     Worker->>Worker: Create JobResult {id, text, output, processed_at}
     Worker->>S3: PutObject jobs/{id}.json

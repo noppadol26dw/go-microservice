@@ -1,6 +1,6 @@
 # Build stage. Pin the builder to the native build platform and cross-compile to
 # the requested target, so multi-arch builds (amd64/arm64) avoid QEMU emulation.
-FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS builder
 
 WORKDIR /build
 
