@@ -1,5 +1,6 @@
-# Build stage
-FROM golang:1.25-alpine AS builder
+# Build stage. Pin the builder to the native build platform and cross-compile to
+# the requested target, so multi-arch builds (amd64/arm64) avoid QEMU emulation.
+FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS builder
 
 WORKDIR /build
 
@@ -15,9 +16,12 @@ RUN go mod download
 # Copy source code
 COPY app/ ./app/
 
-# Build static binary. Output to /build/bin/app so the target does not collide
-# with the ./app source directory (which would make Go write the binary inside it).
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o /build/bin/app ./app
+# Build static binary for the target platform. Output to /build/bin/app so the
+# target does not collide with the ./app source directory (which would make Go
+# write the binary inside it). TARGETOS/TARGETARCH are provided by buildx.
+ARG TARGETOS
+ARG TARGETARCH
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -installsuffix cgo -o /build/bin/app ./app
 
 # Final stage
 FROM gcr.io/distroless/static-debian12:nonroot

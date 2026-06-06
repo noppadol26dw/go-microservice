@@ -9,7 +9,7 @@
   "containerDefinitions": [
     {
       "name": "job-service",
-      "image": "noppadol26dw/job-service:v1",
+      "image": "noppadol26dw/job-service:v2",
       "essential": true,
       "portMappings": [
         { "containerPort": 8080, "protocol": "tcp" }
