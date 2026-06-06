@@ -32,7 +32,7 @@ sequenceDiagram
     end
 
     Note over Client,S3: Background Processing (if WORKER_ENABLED=true)
-    Worker->>SQS: ReceiveMessage (long polling, 20s; MessageAttributeNames: All)
+    Worker->>SQS: ReceiveMessage (long polling 20s, MessageAttributeNames=All)
     SQS-->>Worker: Message {id, text} + trace context
     Worker->>Worker: Extract trace context, start processMessage span
     Worker->>Worker: Process: strings.ToUpper(text)
