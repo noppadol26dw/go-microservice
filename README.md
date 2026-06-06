@@ -146,12 +146,21 @@ docker run -p 8080:8080 \
 
 ### Build and Push to Docker Hub
 
-```bash
-# Build image
-docker build -t noppadol26dw/job-service:v1 .
+The image is published **multi-arch (linux/amd64 + linux/arm64)** so it runs on
+both x86_64 and Graviton/Fargate. Build and push with `buildx` — a plain
+`docker build` on an Apple-Silicon host produces an arm64-only image that will
+not run on default (x86_64) Fargate.
 
-# Push to Docker Hub
-docker push noppadol26dw/job-service:v1
+```bash
+# One-time: a builder that can produce multi-arch manifests
+docker buildx create --name multiarch --driver docker-container --bootstrap --use
+
+# Build both arches and push in one step
+docker buildx build --platform linux/amd64,linux/arm64 \
+  -t noppadol26dw/job-service:v2 --push .
+
+# Verify the published platforms
+docker buildx imagetools inspect noppadol26dw/job-service:v2
 ```
 
 **Docker Hub:** https://hub.docker.com/r/noppadol26dw/job-service
@@ -159,4 +168,5 @@ docker push noppadol26dw/job-service:v1
 ## Deployment
 
 - No CI/CD pipeline is configured in this repo (no `.github/workflows`, no `Jenkinsfile`).
-- Release is manual: `docker build -t noppadol26dw/job-service:vX . && docker push noppadol26dw/job-service:vX`.
+- Release is manual: `docker buildx build --platform linux/amd64,linux/arm64 -t noppadol26dw/job-service:vX --push .`
+- The current image tag is **`v2`**; `deploy/ecs/task-definition.json` references it.
