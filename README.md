@@ -12,11 +12,12 @@ Minimal Go HTTP microservice that accepts text jobs over HTTP, queues them via A
 
 | Component | Version / Detail |
 |---|---|
-| Language | Go 1.23 (`go.mod`) |
+| Language | Go 1.25 (`go.mod`) |
 | HTTP | stdlib `net/http` (no framework), listens on `:8080` |
 | AWS SDK | `aws-sdk-go-v2` — `config`, `service/s3`, `service/sqs` |
+| Observability | OpenTelemetry SDK — OTLP/gRPC traces + metrics, X-Ray propagation, `slog` JSON logs carrying `trace_id`/`span_id` (exports to the ADOT collector sidecar) |
 | IDs | `github.com/google/uuid` |
-| Container base | `golang:1.23-alpine` (build) → `gcr.io/distroless/static-debian12:nonroot` (runtime) |
+| Container base | `golang:1.25-alpine` (build) → `gcr.io/distroless/static-debian12:nonroot` (runtime) |
 
 ## Architecture
 

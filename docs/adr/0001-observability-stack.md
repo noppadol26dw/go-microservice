@@ -1,7 +1,7 @@
 # ADR 0001: Observability Stack
 
-- **Status:** Proposed — deferred, not yet implemented
-- **Date:** 2026-06-05
+- **Status:** Accepted — app instrumented; **ADOT** backend chosen, ECS deployment scaffolded
+- **Date:** 2026-06-05 (updated 2026-06-06)
 - **Supersedes:** the standalone notes formerly in `docs/ADOT.md` and `docs/LGTM.md` (folded into this ADR)
 
 ## Context
@@ -20,7 +20,7 @@ OpenTelemetry Go SDK and differ only in the *backend* the telemetry is shipped t
 - End-to-end trace of a job across HTTP → SQS → Worker → S3 (incl. trace-context propagation through the SQS message).
 - HTTP and worker metrics: request rate, latency, status codes, messages processed, errors.
 - Structured, trace-correlated logs.
-- Deployment target is EKS; operational cost and who runs the backend.
+- Deployment target is AWS ECS/EKS; operational cost and who runs the backend.
 - Vendor lock-in (AWS-native) vs self-hosting (no lock-in, more to operate).
 
 ## Considered Options
@@ -30,15 +30,30 @@ OpenTelemetry Go SDK and differ only in the *backend* the telemetry is shipped t
 
 ## Decision Outcome
 
-**Deferred.** No observability is implemented yet; this ADR records the evaluation
-so the eventual choice is a one-step decision rather than a re-investigation.
+**ADOT, on ECS.** The app is now instrumented with the vendor-neutral
+OpenTelemetry Go SDK (traces + metrics over OTLP/gRPC, X-Ray-compatible trace IDs
+and propagation, trace context carried across the SQS hop) — see `app/otel.go` and
+`app/main.go`. Telemetry is exported to an **ADOT collector sidecar** that ships
+traces → X-Ray and metrics → CloudWatch; the ECS Fargate deployment is scaffolded
+in [`deploy/`](../../deploy/README.md).
 
-Tentative lean (not binding): **ADOT** if the service stays AWS/EKS-native and the
-team wants the lowest operational burden (X-Ray + CloudWatch are managed). Choose
-**LGTM** if observability needs to span multiple clouds/backends or a Grafana stack
-already exists to plug into. Because the app is instrumented with vendor-neutral
-OpenTelemetry in either case, switching backends later is mostly a collector/exporter
+ADOT was chosen over LGTM because the service is AWS/ECS-native and the team wants
+the lowest operational burden (X-Ray + CloudWatch are managed). Should observability
+later need to span multiple clouds/backends, **LGTM** remains viable: because the app
+emits vendor-neutral OpenTelemetry, switching backends is mostly a collector/exporter
 config change, not an app rewrite.
+
+### Implemented
+
+- OTLP traces + metrics, `otelhttp` on the job endpoints, `otelaws` spans for
+  SQS/S3, a `processMessage` span, `jobs.created` counter and
+  `job.processing.duration` histogram, SQS trace-context propagation.
+- Structured, trace-correlated logging: stdlib `log` was replaced with `log/slog`
+  (JSON handler) wrapped to add `trace_id` (X-Ray format) and `span_id` from the
+  active span — see `setupLogging`/`traceHandler` in `app/otel.go`. Use the
+  `slog.*Context(ctx, …)` variants so the span context reaches the handler.
+
+All three decision drivers (traces, metrics, trace-correlated logs) are now met.
 
 ## Comparison
 
@@ -74,9 +89,19 @@ Shared, regardless of backend:
 
 ### Option 1 — ADOT specifics
 
-- Deploy the **ADOT Collector** as a sidecar or daemonset in EKS.
+- Deploy the **ADOT Collector** alongside the service; topology depends on the
+  compute platform:
+  - **EKS** — collector as a sidecar or a daemonset.
+  - **ECS Fargate** — collector as a **sidecar** container in the same task
+    definition; the app reaches it at `localhost:4317` (containers in a task
+    share the `awsvpc` network namespace).
+  - **ECS on EC2** — sidecar (as above) or one collector per instance via an
+    ECS service using the `daemon` scheduling strategy.
 - Export traces → X-Ray, metrics/logs → CloudWatch.
 - Extra dep: `github.com/aws/aws-xray-sdk-go` (optional; OTLP→X-Ray works without it).
+- A worked ECS Fargate deployment (task definition, collector config, IAM) lives
+  in [`deploy/`](../../deploy/README.md) — infrastructure only; the app SDK
+  instrumentation is still pending per this ADR.
 
 ### Option 2 — LGTM specifics
 

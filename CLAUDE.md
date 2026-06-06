@@ -8,9 +8,9 @@ This file adds only the agent-only layer: conventions, guardrails, and gotchas.
 
 ## Code Conventions
 
-- Single package `main` in `app/`. All types (`App`, `JobRequest`, `JobMessage`, `JobResult`) and handlers live in `main.go`. Keep it one file unless a change clearly warrants splitting.
+- Single package `main` in `app/`. All types (`App`, `JobRequest`, `JobMessage`, `JobResult`) and handlers live in `main.go`; OpenTelemetry setup, instruments, and SQS trace-context carriers live in `otel.go`. Keep it to these two files unless a change clearly warrants splitting.
 - Handlers are methods on `*App`; routing uses method-based mux patterns (`GET /jobs/{id}`), so the mux returns `405` for the wrong verb and `r.PathValue` extracts path params.
-- Errors: handlers `http.Error(...)` with an explicit status; worker/helpers wrap with `fmt.Errorf("...: %w", err)`. Logging via stdlib `log`.
+- Errors: handlers `http.Error(...)` with an explicit status; worker/helpers wrap with `fmt.Errorf("...: %w", err)`. Logging via `log/slog` (JSON), set up in `otel.go`; use the `slog.*Context(ctx, …)` variants on request/worker paths so `trace_id`/`span_id` are attached. Startup-fatal paths use `slog.Error` + `os.Exit(1)` (no `log.Fatal`).
 - AWS calls run under bounded contexts: handlers derive from `r.Context()`, the worker from `context.Background()`, each with `awsOpTimeout` (10s); `ReceiveMessage` uses the cancelable root context so shutdown interrupts the long poll.
 - Keep doc comments on exported types/functions — existing code documents every handler and struct field.
 - No automated tests exist yet (`make test` finds none). `*_test.go` is excluded from the Docker build via `.dockerignore`.
@@ -21,7 +21,8 @@ This file adds only the agent-only layer: conventions, guardrails, and gotchas.
 - **No DLQ / retry cap in code.** A message that always fails `processMessage` is logged and left in the queue; redelivery depends on the SQS queue's own redrive policy (configured outside this repo).
 - **Worker processes one message at a time** (`MaxNumberOfMessages: 1`, no concurrency) — a bottleneck under load.
 - **`readyz` is shallow.** It only checks the AWS clients are non-nil (they never are after construction); it does not verify SQS/S3 reachability, so it effectively always returns ready.
-- **Observability is proposed, not built.** No OpenTelemetry/metrics/tracing code exists in `app/main.go`. `docs/adr/0001-observability-stack.md` is a *deferred* ADR evaluating ADOT vs LGTM — don't assume tracing/metrics exist.
+- **Observability is built — traces, metrics, and trace-correlated logs.** `app/otel.go` wires the OpenTelemetry SDK (OTLP/gRPC traces + metrics, X-Ray IDs/propagation, ECS resource detection) and a `log/slog` JSON handler that injects `trace_id`/`span_id`; handlers use `otelhttp`, AWS calls use `otelaws`, the worker has a `processMessage` span, and there are `jobs.created` / `job.processing.duration` instruments. Telemetry exports to the ADOT collector sidecar (`deploy/`).
+- **Telemetry export is non-fatal.** If `setupOTel` fails or the collector is unreachable, the app still serves — instruments fall back to no-ops and spans are dropped. Don't make startup depend on the collector.
 
 ### Recently fixed (do not reintroduce)
 
@@ -55,13 +56,13 @@ This file adds only the agent-only layer: conventions, guardrails, and gotchas.
 
 ## Do's and Don'ts
 
-- **Do** keep the app a single `main.go` unless a change genuinely needs separation.
+- **Do** keep the app to `main.go` + `otel.go` unless a change genuinely needs separation.
 - **Do** keep doc comments on exported identifiers and struct fields.
 - **Do** treat `SQS_QUEUE_URL` and `S3_BUCKET` as required — the app exits without them.
 - **Don't** commit AWS credentials; `.gitignore` already excludes `credentials`, `*.pem`, `*.key`, `.aws/`.
-- **Don't** assume observability (ADOT/LGTM) is wired up — it's design docs only.
+- **Don't** make startup or request handling depend on the OTel collector — telemetry is best-effort (no-ops if export fails).
 - **Don't** add CI assumptions; there is no pipeline in this repo.
 
 ## Last Updated
 
-2026-06-05
+2026-06-06

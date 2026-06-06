@@ -9,7 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -24,6 +24,12 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
 	"github.com/google/uuid"
+
+	"go.opentelemetry.io/contrib/instrumentation/github.com/aws/aws-sdk-go-v2/otelaws"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
 )
 
 const (
@@ -73,6 +79,9 @@ type JobResult struct {
 // the background worker loop for processing jobs. The server shuts down gracefully
 // on SIGINT/SIGTERM.
 func main() {
+	// Install the structured, trace-correlated JSON logger before anything logs.
+	setupLogging()
+
 	// Load AWS region from environment variable, default to us-east-1
 	region := os.Getenv("AWS_REGION")
 	if region == "" {
@@ -82,19 +91,38 @@ func main() {
 	// Load AWS configuration using default credential chain
 	cfg, err := config.LoadDefaultConfig(context.Background(), config.WithRegion(region))
 	if err != nil {
-		log.Fatalf("failed to load AWS config: %v", err)
+		slog.Error("failed to load AWS config", "error", err)
+		os.Exit(1)
 	}
 
 	// Validate required environment variables
 	sqsURL := os.Getenv("SQS_QUEUE_URL")
 	if sqsURL == "" {
-		log.Fatal("SQS_QUEUE_URL environment variable is required")
+		slog.Error("SQS_QUEUE_URL environment variable is required")
+		os.Exit(1)
 	}
 
 	s3Bucket := os.Getenv("S3_BUCKET")
 	if s3Bucket == "" {
-		log.Fatal("S3_BUCKET environment variable is required")
+		slog.Error("S3_BUCKET environment variable is required")
+		os.Exit(1)
 	}
+
+	// Initialize OpenTelemetry (traces + metrics), exporting via OTLP to the
+	// ADOT collector sidecar. Non-fatal: if setup fails the service still runs
+	// and telemetry falls back to no-ops.
+	otelShutdown, err := setupOTel(context.Background())
+	if err != nil {
+		slog.Warn("OpenTelemetry setup failed, continuing without telemetry", "error", err)
+		otelShutdown = func(context.Context) error { return nil }
+	}
+	if err := initInstruments(); err != nil {
+		slog.Warn("failed to initialize metric instruments", "error", err)
+	}
+
+	// Trace every AWS SDK call (SQS, S3). Must be appended before the clients are
+	// constructed so they capture the middleware.
+	otelaws.AppendMiddlewares(&cfg.APIOptions)
 
 	// Initialize application with AWS clients
 	app := &App{
@@ -107,11 +135,13 @@ func main() {
 	// Register HTTP handlers using method-based routing (Go 1.22+). The {id}
 	// wildcard matches a single path segment, so nested paths do not leak
 	// through, and unmatched methods automatically return 405.
+	// Health/readiness probes are left untraced to keep span volume low; the job
+	// endpoints are wrapped with otelhttp to emit server spans.
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", app.healthz)
 	mux.HandleFunc("GET /readyz", app.readyz)
-	mux.HandleFunc("POST /jobs", app.createJob)
-	mux.HandleFunc("GET /jobs/{id}", app.getJob)
+	mux.Handle("POST /jobs", otelhttp.NewHandler(http.HandlerFunc(app.createJob), "createJob"))
+	mux.Handle("GET /jobs/{id}", otelhttp.NewHandler(http.HandlerFunc(app.getJob), "getJob"))
 
 	// Root context cancelled on SIGINT/SIGTERM, used to stop the worker loop
 	// and trigger graceful HTTP shutdown.
@@ -121,7 +151,7 @@ func main() {
 	// Start worker loop if enabled
 	if os.Getenv("WORKER_ENABLED") == "true" {
 		go app.workerLoop(ctx)
-		log.Println("Worker enabled, starting background processing")
+		slog.Info("worker enabled, starting background processing")
 	}
 
 	server := &http.Server{
@@ -136,7 +166,7 @@ func main() {
 	// Run the server in the background so main can wait for a shutdown signal.
 	serverErr := make(chan error, 1)
 	go func() {
-		log.Printf("Server starting on %s", addr)
+		slog.Info("server starting", "addr", addr)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			serverErr <- err
 		}
@@ -145,9 +175,10 @@ func main() {
 	// Wait for either a fatal server error or a shutdown signal.
 	select {
 	case err := <-serverErr:
-		log.Fatalf("server failed: %v", err)
+		slog.Error("server failed", "error", err)
+		os.Exit(1)
 	case <-ctx.Done():
-		log.Println("shutdown signal received, draining connections")
+		slog.Info("shutdown signal received, draining connections")
 	}
 
 	// Graceful shutdown: stop accepting new connections and let in-flight
@@ -155,9 +186,16 @@ func main() {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 	if err := server.Shutdown(shutdownCtx); err != nil {
-		log.Printf("graceful shutdown failed: %v", err)
+		slog.Error("graceful shutdown failed", "error", err)
 	}
-	log.Println("server stopped")
+
+	// Flush and stop telemetry exporters so buffered spans/metrics are not lost.
+	flushCtx, flushCancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer flushCancel()
+	if err := otelShutdown(flushCtx); err != nil {
+		slog.Error("OpenTelemetry shutdown failed", "error", err)
+	}
+	slog.Info("server stopped")
 }
 
 // healthz handles GET /healthz requests.
@@ -219,12 +257,16 @@ func (a *App) createJob(w http.ResponseWriter, r *http.Request) {
 	_, err = a.sqsClient.SendMessage(ctx, &sqs.SendMessageInput{
 		QueueUrl:    aws.String(a.sqsURL),
 		MessageBody: aws.String(string(messageBody)),
+		// Carry the current trace context through the queue so the worker can
+		// continue the same trace when it processes this job.
+		MessageAttributes: otelSQSAttributes(ctx),
 	})
 	if err != nil {
-		log.Printf("failed to send message: %v", err)
+		slog.ErrorContext(ctx, "failed to send message", "error", err)
 		http.Error(w, "failed to send message", http.StatusInternalServerError)
 		return
 	}
+	jobsCreated.Add(ctx, 1)
 
 	// Return job ID
 	w.Header().Set("Content-Type", "application/json")
@@ -260,7 +302,7 @@ func (a *App) getJob(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "job not found", http.StatusNotFound)
 			return
 		}
-		log.Printf("failed to get object %q: %v", key, err)
+		slog.ErrorContext(ctx, "failed to get object", "key", key, "error", err)
 		http.Error(w, "failed to get job", http.StatusInternalServerError)
 		return
 	}
@@ -288,7 +330,7 @@ func (a *App) workerLoop(ctx context.Context) {
 	for {
 		// Stop promptly if shutdown was requested.
 		if ctx.Err() != nil {
-			log.Println("worker stopping")
+			slog.Info("worker stopping")
 			return
 		}
 
@@ -298,13 +340,16 @@ func (a *App) workerLoop(ctx context.Context) {
 			QueueUrl:            aws.String(a.sqsURL),
 			MaxNumberOfMessages: 1,
 			WaitTimeSeconds:     20, // Long polling
+			// Return custom attributes so the worker can recover the trace
+			// context that createJob injected.
+			MessageAttributeNames: []string{"All"},
 		})
 		if err != nil {
 			if ctx.Err() != nil {
-				log.Println("worker stopping")
+				slog.Info("worker stopping")
 				return
 			}
-			log.Printf("failed to receive message: %v", err)
+			slog.Error("failed to receive message", "error", err)
 			// Back off before retrying, but stay responsive to shutdown.
 			select {
 			case <-ctx.Done():
@@ -317,8 +362,12 @@ func (a *App) workerLoop(ctx context.Context) {
 		// Process each received message. Use a background-derived context so
 		// the in-flight message completes even if shutdown is in progress.
 		for _, message := range result.Messages {
-			if err := a.processMessage(message); err != nil {
-				log.Printf("failed to process message: %v", err)
+			// Continue the trace started in createJob, carried via SQS attributes.
+			// A background-derived context keeps the in-flight message processing
+			// even if shutdown is in progress.
+			msgCtx := otelSQSContext(context.Background(), message.MessageAttributes)
+			if err := a.processMessage(msgCtx, message); err != nil {
+				slog.ErrorContext(msgCtx, "failed to process message", "error", err)
 				continue
 			}
 
@@ -330,7 +379,7 @@ func (a *App) workerLoop(ctx context.Context) {
 			})
 			cancel()
 			if err != nil {
-				log.Printf("failed to delete message: %v", err)
+				slog.ErrorContext(msgCtx, "failed to delete message", "error", err)
 			}
 		}
 	}
@@ -340,12 +389,27 @@ func (a *App) workerLoop(ctx context.Context) {
 // Unmarshals the message, converts text to uppercase, creates a job result,
 // and stores it in S3 at jobs/{id}.json.
 // Returns an error if any step fails.
-func (a *App) processMessage(message types.Message) error {
+func (a *App) processMessage(ctx context.Context, message types.Message) (err error) {
+	// Span continuing the job's trace; record processing duration on the way out
+	// and mark the span failed on error.
+	ctx, span := tracer.Start(ctx, "processMessage")
+	defer span.End()
+	start := time.Now()
+	defer func() {
+		jobProcessingDuration.Record(ctx, time.Since(start).Seconds(),
+			metric.WithAttributes(attribute.Bool("error", err != nil)))
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		}
+	}()
+
 	// Unmarshal message body
 	var jobMsg JobMessage
 	if err := json.Unmarshal([]byte(*message.Body), &jobMsg); err != nil {
 		return fmt.Errorf("failed to unmarshal message: %w", err)
 	}
+	span.SetAttributes(attribute.String("job.id", jobMsg.ID))
 
 	// Process text: convert to uppercase
 	output := strings.ToUpper(jobMsg.Text)
@@ -365,11 +429,12 @@ func (a *App) processMessage(message types.Message) error {
 	}
 
 	// Store result in S3, bounded by a per-operation timeout so a hung put
-	// cannot stall the worker indefinitely.
-	ctx, cancel := context.WithTimeout(context.Background(), awsOpTimeout)
+	// cannot stall the worker indefinitely. Derived from the span context so the
+	// S3 call appears as a child span in the trace.
+	putCtx, cancel := context.WithTimeout(ctx, awsOpTimeout)
 	defer cancel()
 	key := fmt.Sprintf("jobs/%s.json", jobMsg.ID)
-	_, err = a.s3Client.PutObject(ctx, &s3.PutObjectInput{
+	_, err = a.s3Client.PutObject(putCtx, &s3.PutObjectInput{
 		Bucket:      aws.String(a.s3Bucket),
 		Key:         aws.String(key),
 		Body:        bytes.NewReader(resultBody),
