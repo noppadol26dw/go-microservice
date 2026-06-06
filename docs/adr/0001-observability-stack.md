@@ -1,7 +1,7 @@
 # ADR 0001: Observability Stack
 
-- **Status:** Proposed — deferred, not yet implemented
-- **Date:** 2026-06-05
+- **Status:** Accepted — app instrumented; **ADOT** backend chosen, ECS deployment scaffolded
+- **Date:** 2026-06-05 (updated 2026-06-06)
 - **Supersedes:** the standalone notes formerly in `docs/ADOT.md` and `docs/LGTM.md` (folded into this ADR)
 
 ## Context
@@ -30,15 +30,27 @@ OpenTelemetry Go SDK and differ only in the *backend* the telemetry is shipped t
 
 ## Decision Outcome
 
-**Deferred.** No observability is implemented yet; this ADR records the evaluation
-so the eventual choice is a one-step decision rather than a re-investigation.
+**ADOT, on ECS.** The app is now instrumented with the vendor-neutral
+OpenTelemetry Go SDK (traces + metrics over OTLP/gRPC, X-Ray-compatible trace IDs
+and propagation, trace context carried across the SQS hop) — see `app/otel.go` and
+`app/main.go`. Telemetry is exported to an **ADOT collector sidecar** that ships
+traces → X-Ray and metrics → CloudWatch; the ECS Fargate deployment is scaffolded
+in [`deploy/`](../../deploy/README.md).
 
-Tentative lean (not binding): **ADOT** if the service stays AWS/EKS-native and the
-team wants the lowest operational burden (X-Ray + CloudWatch are managed). Choose
-**LGTM** if observability needs to span multiple clouds/backends or a Grafana stack
-already exists to plug into. Because the app is instrumented with vendor-neutral
-OpenTelemetry in either case, switching backends later is mostly a collector/exporter
+ADOT was chosen over LGTM because the service is AWS/ECS-native and the team wants
+the lowest operational burden (X-Ray + CloudWatch are managed). Should observability
+later need to span multiple clouds/backends, **LGTM** remains viable: because the app
+emits vendor-neutral OpenTelemetry, switching backends is mostly a collector/exporter
 config change, not an app rewrite.
+
+### Implemented vs still open
+
+- **Done:** OTLP traces + metrics, `otelhttp` on the job endpoints, `otelaws` spans
+  for SQS/S3, a `processMessage` span, `jobs.created` counter and
+  `job.processing.duration` histogram, SQS trace-context propagation.
+- **Not yet:** structured, trace-correlated logging — the app still uses stdlib
+  `log`. Swapping to `slog` carrying `trace_id` (see sketch below) is the remaining
+  follow-up.
 
 ## Comparison
 
