@@ -9,7 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -79,6 +79,9 @@ type JobResult struct {
 // the background worker loop for processing jobs. The server shuts down gracefully
 // on SIGINT/SIGTERM.
 func main() {
+	// Install the structured, trace-correlated JSON logger before anything logs.
+	setupLogging()
+
 	// Load AWS region from environment variable, default to us-east-1
 	region := os.Getenv("AWS_REGION")
 	if region == "" {
@@ -88,18 +91,21 @@ func main() {
 	// Load AWS configuration using default credential chain
 	cfg, err := config.LoadDefaultConfig(context.Background(), config.WithRegion(region))
 	if err != nil {
-		log.Fatalf("failed to load AWS config: %v", err)
+		slog.Error("failed to load AWS config", "error", err)
+		os.Exit(1)
 	}
 
 	// Validate required environment variables
 	sqsURL := os.Getenv("SQS_QUEUE_URL")
 	if sqsURL == "" {
-		log.Fatal("SQS_QUEUE_URL environment variable is required")
+		slog.Error("SQS_QUEUE_URL environment variable is required")
+		os.Exit(1)
 	}
 
 	s3Bucket := os.Getenv("S3_BUCKET")
 	if s3Bucket == "" {
-		log.Fatal("S3_BUCKET environment variable is required")
+		slog.Error("S3_BUCKET environment variable is required")
+		os.Exit(1)
 	}
 
 	// Initialize OpenTelemetry (traces + metrics), exporting via OTLP to the
@@ -107,11 +113,11 @@ func main() {
 	// and telemetry falls back to no-ops.
 	otelShutdown, err := setupOTel(context.Background())
 	if err != nil {
-		log.Printf("OpenTelemetry setup failed, continuing without telemetry: %v", err)
+		slog.Warn("OpenTelemetry setup failed, continuing without telemetry", "error", err)
 		otelShutdown = func(context.Context) error { return nil }
 	}
 	if err := initInstruments(); err != nil {
-		log.Printf("failed to initialize metric instruments: %v", err)
+		slog.Warn("failed to initialize metric instruments", "error", err)
 	}
 
 	// Trace every AWS SDK call (SQS, S3). Must be appended before the clients are
@@ -145,7 +151,7 @@ func main() {
 	// Start worker loop if enabled
 	if os.Getenv("WORKER_ENABLED") == "true" {
 		go app.workerLoop(ctx)
-		log.Println("Worker enabled, starting background processing")
+		slog.Info("worker enabled, starting background processing")
 	}
 
 	server := &http.Server{
@@ -160,7 +166,7 @@ func main() {
 	// Run the server in the background so main can wait for a shutdown signal.
 	serverErr := make(chan error, 1)
 	go func() {
-		log.Printf("Server starting on %s", addr)
+		slog.Info("server starting", "addr", addr)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			serverErr <- err
 		}
@@ -169,9 +175,10 @@ func main() {
 	// Wait for either a fatal server error or a shutdown signal.
 	select {
 	case err := <-serverErr:
-		log.Fatalf("server failed: %v", err)
+		slog.Error("server failed", "error", err)
+		os.Exit(1)
 	case <-ctx.Done():
-		log.Println("shutdown signal received, draining connections")
+		slog.Info("shutdown signal received, draining connections")
 	}
 
 	// Graceful shutdown: stop accepting new connections and let in-flight
@@ -179,16 +186,16 @@ func main() {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 	if err := server.Shutdown(shutdownCtx); err != nil {
-		log.Printf("graceful shutdown failed: %v", err)
+		slog.Error("graceful shutdown failed", "error", err)
 	}
 
 	// Flush and stop telemetry exporters so buffered spans/metrics are not lost.
 	flushCtx, flushCancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer flushCancel()
 	if err := otelShutdown(flushCtx); err != nil {
-		log.Printf("OpenTelemetry shutdown failed: %v", err)
+		slog.Error("OpenTelemetry shutdown failed", "error", err)
 	}
-	log.Println("server stopped")
+	slog.Info("server stopped")
 }
 
 // healthz handles GET /healthz requests.
@@ -255,7 +262,7 @@ func (a *App) createJob(w http.ResponseWriter, r *http.Request) {
 		MessageAttributes: otelSQSAttributes(ctx),
 	})
 	if err != nil {
-		log.Printf("failed to send message: %v", err)
+		slog.ErrorContext(ctx, "failed to send message", "error", err)
 		http.Error(w, "failed to send message", http.StatusInternalServerError)
 		return
 	}
@@ -295,7 +302,7 @@ func (a *App) getJob(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "job not found", http.StatusNotFound)
 			return
 		}
-		log.Printf("failed to get object %q: %v", key, err)
+		slog.ErrorContext(ctx, "failed to get object", "key", key, "error", err)
 		http.Error(w, "failed to get job", http.StatusInternalServerError)
 		return
 	}
@@ -323,7 +330,7 @@ func (a *App) workerLoop(ctx context.Context) {
 	for {
 		// Stop promptly if shutdown was requested.
 		if ctx.Err() != nil {
-			log.Println("worker stopping")
+			slog.Info("worker stopping")
 			return
 		}
 
@@ -339,10 +346,10 @@ func (a *App) workerLoop(ctx context.Context) {
 		})
 		if err != nil {
 			if ctx.Err() != nil {
-				log.Println("worker stopping")
+				slog.Info("worker stopping")
 				return
 			}
-			log.Printf("failed to receive message: %v", err)
+			slog.Error("failed to receive message", "error", err)
 			// Back off before retrying, but stay responsive to shutdown.
 			select {
 			case <-ctx.Done():
@@ -360,7 +367,7 @@ func (a *App) workerLoop(ctx context.Context) {
 			// even if shutdown is in progress.
 			msgCtx := otelSQSContext(context.Background(), message.MessageAttributes)
 			if err := a.processMessage(msgCtx, message); err != nil {
-				log.Printf("failed to process message: %v", err)
+				slog.ErrorContext(msgCtx, "failed to process message", "error", err)
 				continue
 			}
 
@@ -372,7 +379,7 @@ func (a *App) workerLoop(ctx context.Context) {
 			})
 			cancel()
 			if err != nil {
-				log.Printf("failed to delete message: %v", err)
+				slog.ErrorContext(msgCtx, "failed to delete message", "error", err)
 			}
 		}
 	}

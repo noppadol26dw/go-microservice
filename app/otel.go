@@ -9,6 +9,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"os"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	sqstypes "github.com/aws/aws-sdk-go-v2/service/sqs/types"
@@ -24,11 +26,55 @@ import (
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // instrumentationScope names the tracer/meter so telemetry is attributable to
 // this service.
 const instrumentationScope = "go-microservice"
+
+// setupLogging installs a JSON slog handler as the default logger, wrapped so
+// that records carrying a recording span also get trace_id/span_id. Call once,
+// before anything logs.
+func setupLogging() {
+	base := slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})
+	slog.SetDefault(slog.New(&traceHandler{base}))
+}
+
+// traceHandler decorates a slog.Handler, adding the current trace_id/span_id
+// (when a valid span is in the record's context) so logs correlate with traces.
+// Use the *Context log variants (slog.InfoContext, slog.ErrorContext, ...) to
+// feed it the span-carrying context.
+type traceHandler struct{ slog.Handler }
+
+func (h *traceHandler) Handle(ctx context.Context, r slog.Record) error {
+	if sc := trace.SpanContextFromContext(ctx); sc.IsValid() {
+		// X-Ray-formatted trace id (1-{8 hex}-{24 hex}) so log lines join to the
+		// trace in X-Ray / CloudWatch rather than the raw 32-hex OTel form.
+		r.AddAttrs(
+			slog.String("trace_id", xrayTraceID(sc.TraceID())),
+			slog.String("span_id", sc.SpanID().String()),
+		)
+	}
+	return h.Handler.Handle(ctx, r)
+}
+
+func (h *traceHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &traceHandler{h.Handler.WithAttrs(attrs)}
+}
+
+func (h *traceHandler) WithGroup(name string) slog.Handler {
+	return &traceHandler{h.Handler.WithGroup(name)}
+}
+
+// xrayTraceID renders an OpenTelemetry trace ID in AWS X-Ray's textual form:
+// "1-" + first 8 hex digits + "-" + the remaining 24. The X-Ray ID generator
+// puts the request epoch in those first 8 digits, so this is the value X-Ray and
+// CloudWatch use to key a trace.
+func xrayTraceID(t trace.TraceID) string {
+	s := t.String() // 32 lowercase hex chars
+	return "1-" + s[0:8] + "-" + s[8:32]
+}
 
 // tracer is the package-wide tracer. It delegates to the global provider, so it
 // picks up the real provider installed by setupOTel (and is a safe no-op until

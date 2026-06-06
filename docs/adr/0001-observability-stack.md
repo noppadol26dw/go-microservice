@@ -43,14 +43,17 @@ later need to span multiple clouds/backends, **LGTM** remains viable: because th
 emits vendor-neutral OpenTelemetry, switching backends is mostly a collector/exporter
 config change, not an app rewrite.
 
-### Implemented vs still open
+### Implemented
 
-- **Done:** OTLP traces + metrics, `otelhttp` on the job endpoints, `otelaws` spans
-  for SQS/S3, a `processMessage` span, `jobs.created` counter and
+- OTLP traces + metrics, `otelhttp` on the job endpoints, `otelaws` spans for
+  SQS/S3, a `processMessage` span, `jobs.created` counter and
   `job.processing.duration` histogram, SQS trace-context propagation.
-- **Not yet:** structured, trace-correlated logging — the app still uses stdlib
-  `log`. Swapping to `slog` carrying `trace_id` (see sketch below) is the remaining
-  follow-up.
+- Structured, trace-correlated logging: stdlib `log` was replaced with `log/slog`
+  (JSON handler) wrapped to add `trace_id` (X-Ray format) and `span_id` from the
+  active span — see `setupLogging`/`traceHandler` in `app/otel.go`. Use the
+  `slog.*Context(ctx, …)` variants so the span context reaches the handler.
+
+All three decision drivers (traces, metrics, trace-correlated logs) are now met.
 
 ## Comparison
 
