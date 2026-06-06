@@ -1,0 +1,68 @@
+{
+  "family": "job-service",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "512",
+  "memory": "1024",
+  "executionRoleArn": "arn:aws:iam::<ACCOUNT_ID>:role/job-service-execution-role",
+  "taskRoleArn": "arn:aws:iam::<ACCOUNT_ID>:role/job-service-task-role",
+  "containerDefinitions": [
+    {
+      "name": "job-service",
+      "image": "noppadol26dw/job-service:v1",
+      "essential": true,
+      "portMappings": [
+        { "containerPort": 8080, "protocol": "tcp" }
+      ],
+      "environment": [
+        { "name": "AWS_REGION", "value": "us-east-1" },
+        { "name": "SQS_QUEUE_URL", "value": "https://sqs.us-east-1.amazonaws.com/<ACCOUNT_ID>/job-queue" },
+        { "name": "S3_BUCKET", "value": "<your-bucket-name>" },
+        { "name": "WORKER_ENABLED", "value": "true" },
+        { "name": "OTEL_EXPORTER_OTLP_ENDPOINT", "value": "http://localhost:4317" },
+        { "name": "OTEL_SERVICE_NAME", "value": "job-service" },
+        { "name": "OTEL_RESOURCE_ATTRIBUTES", "value": "service.namespace=labs,deployment.environment=production" }
+      ],
+      "dependsOn": [
+        { "containerName": "aws-otel-collector", "condition": "START" }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/job-service",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "app",
+          "awslogs-create-group": "true"
+        }
+      }
+    },
+    {
+      "name": "aws-otel-collector",
+      "image": "public.ecr.aws/aws-observability/aws-otel-collector:latest",
+      "essential": true,
+      "command": ["--config=env:AOT_CONFIG_CONTENT"],
+      "secrets": [
+        {
+          "name": "AOT_CONFIG_CONTENT",
+          "valueFrom": "arn:aws:ssm:us-east-1:<ACCOUNT_ID>:parameter/job-service/otel-collector-config"
+        }
+      ],
+      "healthCheck": {
+        "command": ["CMD", "/healthcheck"],
+        "interval": 5,
+        "timeout": 6,
+        "retries": 5,
+        "startPeriod": 1
+      },
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/job-service",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "otel-collector",
+          "awslogs-create-group": "true"
+        }
+      }
+    }
+  ]
+}

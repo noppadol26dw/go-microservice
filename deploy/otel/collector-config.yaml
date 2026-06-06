@@ -1,0 +1,52 @@
+# ADOT Collector configuration for the job-service ECS task.
+#
+# This is the config the `aws-otel-collector` sidecar runs with. It is NOT
+# baked into the image — upload it to SSM Parameter Store and the task
+# definition injects it via the AOT_CONFIG_CONTENT secret (see deploy/README.md).
+#
+# Pipeline: the app exports OTLP to localhost:4317 -> this collector ->
+#   traces  -> AWS X-Ray
+#   metrics -> CloudWatch (EMF)
+#
+# NOTE: the app (app/main.go) is not yet OTel-instrumented — see ADR 0001,
+# which remains "proposed". This config is the deployment-side scaffolding so
+# that the moment the SDK is wired in, telemetry has somewhere to land.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # Tag every span/metric with ECS task metadata (task ARN, cluster, etc.)
+  # read from the ECS_CONTAINER_METADATA_URI_V4 endpoint — no app code needed.
+  resourcedetection:
+    detectors: [env, ecs]
+    timeout: 2s
+  batch:
+    timeout: 5s
+
+exporters:
+  awsxray:
+    region: us-east-1
+  awsemf:
+    region: us-east-1
+    namespace: job-service
+    log_group_name: /ecs/job-service/metrics
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [resourcedetection, batch]
+      exporters: [awsxray]
+    metrics:
+      receivers: [otlp]
+      processors: [resourcedetection, batch]
+      exporters: [awsemf]
+  telemetry:
+    logs:
+      level: info

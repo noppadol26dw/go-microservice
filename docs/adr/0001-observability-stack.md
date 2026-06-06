@@ -20,7 +20,7 @@ OpenTelemetry Go SDK and differ only in the *backend* the telemetry is shipped t
 - End-to-end trace of a job across HTTP → SQS → Worker → S3 (incl. trace-context propagation through the SQS message).
 - HTTP and worker metrics: request rate, latency, status codes, messages processed, errors.
 - Structured, trace-correlated logs.
-- Deployment target is EKS; operational cost and who runs the backend.
+- Deployment target is AWS ECS/EKS; operational cost and who runs the backend.
 - Vendor lock-in (AWS-native) vs self-hosting (no lock-in, more to operate).
 
 ## Considered Options
@@ -74,9 +74,19 @@ Shared, regardless of backend:
 
 ### Option 1 — ADOT specifics
 
-- Deploy the **ADOT Collector** as a sidecar or daemonset in EKS.
+- Deploy the **ADOT Collector** alongside the service; topology depends on the
+  compute platform:
+  - **EKS** — collector as a sidecar or a daemonset.
+  - **ECS Fargate** — collector as a **sidecar** container in the same task
+    definition; the app reaches it at `localhost:4317` (containers in a task
+    share the `awsvpc` network namespace).
+  - **ECS on EC2** — sidecar (as above) or one collector per instance via an
+    ECS service using the `daemon` scheduling strategy.
 - Export traces → X-Ray, metrics/logs → CloudWatch.
 - Extra dep: `github.com/aws/aws-xray-sdk-go` (optional; OTLP→X-Ray works without it).
+- A worked ECS Fargate deployment (task definition, collector config, IAM) lives
+  in [`deploy/`](../../deploy/README.md) — infrastructure only; the app SDK
+  instrumentation is still pending per this ADR.
 
 ### Option 2 — LGTM specifics
 
